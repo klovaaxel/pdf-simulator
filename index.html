@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <title>PDF-Like Page Demo</title>
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <style>
+            /* ====== GLOBAL RESETS ====== */
+            * {
+                box-sizing: border-box;
+            }
+            html,
+            body {
+                margin: 0;
+                padding: 0;
+            }
+            body {
+                font-family: "Times New Roman", Times, serif;
+                line-height: 1.25;
+                background: #ececec;
+                color: #111;
+                counter-reset: pageNumber;
+            }
+
+            /* ==== PAGE CONFIG (A4) ==== */
+            :root {
+                --page-width: 210mm;
+                --page-height: 297mm;
+                --page-margin-top: 20mm;
+                --page-margin-right: 20mm;
+                --page-margin-bottom: 25mm; /* extra for footer */
+                --page-margin-left: 20mm;
+                --printable-height: calc(var(--page-height) - var(--page-margin-top) - var(--page-margin-bottom));
+            }
+
+            @page {
+                size: A4; /* Could switch to letter: 8.5in 11in */
+                margin: 20mm 20mm 25mm 20mm; /* MUST mirror CSS vars for print fidelity */
+            }
+
+            /* Screen visualization of pages */
+            .page {
+                position: relative;
+                width: var(--page-width);
+                height: var(--page-height);
+                padding: var(--page-margin-top) var(--page-margin-right) var(--page-margin-bottom)
+                    var(--page-margin-left);
+                background: #fff;
+                margin: 10px auto; /* spacing between artificial pages on screen */
+                box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+                overflow: hidden; /* we control pagination, no accidental spill */
+                display: flex;
+                flex-direction: column;
+            }
+
+            .page {
+                counter-increment: pageNumber;
+            }
+
+            .page-header {
+                font-size: 14px;
+                font-weight: 600;
+                letter-spacing: 0.5px;
+                margin-bottom: 6mm;
+                border-bottom: 1px solid #444;
+                padding-bottom: 2mm;
+            }
+
+            .page-footer {
+                position: absolute;
+                left: var(--page-margin-left);
+                right: var(--page-margin-right);
+                bottom: 8mm;
+                font-size: 12px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                color: #333;
+                border-top: 1px solid #888;
+                padding-top: 2mm;
+            }
+
+            .page-footer .page-number::after {
+                content: "Page " counter(pageNumber);
+            }
+
+            /* The vertical space available for flowing dynamic content */
+            .page-content {
+                flex: 1 1 auto;
+                /* Create a new block formatting context so measuring height is predictable */
+                overflow: hidden;
+                display: block;
+                position: relative;
+            }
+
+            h1,
+            h2,
+            h3 {
+                font-family: Georgia, serif;
+                font-weight: 700;
+                margin: 0 0 4mm;
+                line-height: 1.15;
+            }
+            h1 {
+                font-size: 22pt;
+            }
+            h2 {
+                font-size: 16pt;
+                margin-top: 6mm;
+            }
+            h3 {
+                font-size: 13pt;
+                margin-top: 5mm;
+            }
+            p {
+                margin: 0 0 4mm;
+                text-align: justify;
+                hyphens: auto;
+            }
+            ul,
+            ol {
+                margin: 0 0 4mm 6mm;
+            }
+
+            /* Utility classes for controlling breaks when you DO have some control */
+            .avoid-break {
+                break-inside: avoid;
+                page-break-inside: avoid;
+            }
+            .force-break-before {
+                page-break-before: always;
+                break-before: page;
+            }
+            .force-break-after {
+                page-break-after: always;
+                break-after: page;
+            }
+
+            /* Table styling example */
+            table {
+                width: 100%;
+                border-collapse: collapse;
+                margin: 0 0 4mm;
+                font-size: 11pt;
+            }
+            th,
+            td {
+                border: 1px solid #444;
+                padding: 2mm 3mm;
+                vertical-align: top;
+            }
+            thead {
+                background: #f2f2f2;
+            }
+            tr.avoid-break {
+                break-inside: avoid;
+            }
+
+            /* Print adjustments (remove screen chrome, ensure continuous pages) */
+            @media print {
+                body {
+                    background: #fff;
+                }
+                .page {
+                    margin: 0 auto;
+                    box-shadow: none;
+                    page-break-after: always;
+                }
+                .page:last-child {
+                    page-break-after: auto;
+                }
+                /* Ensure colors (browsers may still require user setting 'Print Backgrounds') */
+                .page-header {
+                    -webkit-print-color-adjust: exact;
+                    print-color-adjust: exact;
+                }
+            }
+
+            /* Optional: Visual debug overlay for page-content height (toggle by adding .debug class to body) */
+            body.debug .page-content::after {
+                content: attr(data-height-used) "/" attr(data-height-limit) "px";
+                position: absolute;
+                right: 2mm;
+                top: 2mm;
+                font: 10px monospace;
+                background: rgba(255, 255, 0, 0.6);
+                padding: 2px 4px;
+            }
+        </style>
+    </head>
+    <body contenteditable="true">
+        <!-- Container whose children (sections) will be paginated dynamically -->
+        <div id="dynamic-sections" style="display: none">
+            <h1>PDF-like Page Layout Demo</h1>
+            <p>
+                This demonstration shows how to make an HTML document render and print with stable pagination closely
+                matching a PDF: fixed physical dimensions (A4), consistent margins, headers/footers, page numbers, and
+                graceful page-breaking of dynamic content whose exact length you may not control.
+            </p>
+            <p>
+                The approach combines CSS (physical units, @page, counters, page-break utilities) with a light
+                JavaScript pagination pass that measures overflow and migrates overflowing semantic blocks to subsequent
+                pages. This keeps the DOM readable and avoids manually slicing text mid-paragraph.
+            </p>
+
+            <h2>Key Techniques</h2>
+            <ul>
+                <li><strong>Physical units:</strong> All core dimensions use millimeters (A4 = 210mm × 297mm).</li>
+                <li><strong>@page rule:</strong> Aligns print margins with on-screen simulation.</li>
+                <li>
+                    <strong>Page shell:</strong> Each logical page is a <code>div.page</code> with header, footer, and a
+                    measured <code>.page-content</code> region.
+                </li>
+                <li><strong>CSS counters:</strong> Increment page numbers automatically.</li>
+                <li>
+                    <strong>Overflow algorithm:</strong> JS places whole sections; if adding a section causes overflow
+                    beyond printable height, it moves it to a new page.
+                </li>
+                <li>
+                    <strong>Utilities:</strong> Classes like <code>.avoid-break</code> offer hints when you can annotate
+                    source blocks.
+                </li>
+            </ul>
+
+            <h2>Dynamic Content Considerations</h2>
+            <p>
+                Because content length is unpredictable, purely declarative CSS page breaks can produce orphaned
+                headings or split tables. The JavaScript layer inspects cumulative height after appending each section
+                and triggers a new page before the overflow becomes visible.
+            </p>
+            <p>
+                For extremely long single elements (e.g., a giant table) exceeding one page alone, a more advanced
+                splitter would be needed (row-by-row migration or canvas pagination). This demo keeps logic
+                intentionally lightweight.
+            </p>
+
+            <h2>Sample Data Table</h2>
+            <p class="avoid-break">
+                This table demonstrates repeating structured data. Rows are split across pages as needed.
+            </p>
+            <table>
+                <thead>
+                    <tr class="avoid-break">
+                        <th>#</th>
+                        <th>Item</th>
+                        <th>Description</th>
+                        <th>Qty</th>
+                        <th>Price</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>1</td>
+                        <td>Item 1</td>
+                        <td>Description for item 1</td>
+                        <td>10</td>
+                        <td>$100</td>
+                    </tr>
+                    <tr>
+                        <td>2</td>
+                        <td>Item 2</td>
+                        <td>Description for item 2</td>
+                        <td>5</td>
+                        <td>$50</td>
+                    </tr>
+                    <tr>
+                        <td>3</td>
+                        <td>Item 3</td>
+                        <td>Description for item 3</td>
+                        <td>20</td>
+                        <td>$200</td>
+                    </tr>
+                    <tr>
+                        <td>4</td>
+                        <td>Item 4</td>
+                        <td>Description for item 4</td>
+                        <td>15</td>
+                        <td>$150</td>
+                    </tr>
+                    <tr>
+                        <td>5</td>
+                        <td>Item 5</td>
+                        <td>Description for item 5</td>
+                        <td>8</td>
+                        <td>$80</td>
+                    </tr>
+                    <tr>
+                        <td>6</td>
+                        <td>Item 6</td>
+                        <td>Description for item 6</td>
+                        <td>12</td>
+                        <td>$120</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h2>Forcing a Manual Break</h2>
+            <p>
+                You can force a manual page break by adding the class <code>force-break-before</code> or
+                <code>force-break-after</code> to a block. After this paragraph, there is a forced break before the next
+                section.
+            </p>
+
+            <div class="force-break-after"></div>
+
+            <h2>Limitations & Notes</h2>
+            <ul>
+                <li>Browser print engines differ slightly; millimeter accuracy is approximate.</li>
+                <li>User print settings (margins, scale, background graphics) must remain default for fidelity.</li>
+                <li>
+                    Running headers/footers (CSS Paged Media Module Level 3) have partial support; we emulate per-page
+                    duplicates.
+                </li>
+                <li>
+                    Long unbreakable content (huge images, wide tables) may overflow; consider pre-processing or more
+                    granular splitting.
+                </li>
+                <li>
+                    Editing content directly in the browser may affect measurements and page overflow; Re-evaluate
+                    layout and styles as needed. (we first need to turn the paginated content back to non paginated to
+                    then reapply pagination, and this can't be done when the user is actively editing as that would
+                    remove focus from the editable element)
+                </li>
+            </ul>
+
+            <h2>Conclusion</h2>
+            <p>
+                This approach yields a maintainable, semantic HTML structure that prints like a PDF while remaining
+                accessible and indexable. Adjust variables, refine the pagination algorithm, and incorporate
+                content-specific rules to reach near-PDF parity.
+            </p>
+        </div>
+        <!-- Pagination target root -->
+        <div id="pages-root"></div>
+        <script>
+            (function () {
+                // ===== Public API =====
+                window.rebuildPDFView = rebuildPDFView; // builds & injects into #pages-root, returns HTML string
+                window.buildPDFViewHTML = buildPDFViewHTML; // returns HTML string only (does not inject)
+
+                document.addEventListener("DOMContentLoaded", () => {
+                    rebuildPDFView();
+                });
+
+                // ===== High-level API =====
+                function rebuildPDFView(options = {}) {
+                    const pagesRoot = document.getElementById("pages-root");
+                    if (!pagesRoot) return "";
+                    const html = buildPDFViewHTML(options);
+                    pagesRoot.innerHTML = html;
+                    return html;
+                }
+
+                function buildPDFViewHTML(options = {}) {
+                    const dynamicRoot = document.getElementById("dynamic-sections");
+                    if (!dynamicRoot) return "";
+
+                    if (options.regenerate === true) {
+                        generateDynamicContent(dynamicRoot, true);
+                    }
+
+                    // Off-DOM container for accurate layout measurements
+                    const tempHost = document.createElement("div");
+                    tempHost.style.cssText = "position:absolute;left:-9999px;top:0;visibility:hidden;";
+                    document.body.appendChild(tempHost);
+
+                    const { pages } = paginate(dynamicRoot, tempHost, options);
+                    const html = pages.map((p) => p.outerHTML).join("");
+                    document.body.removeChild(tempHost);
+                    return html;
+                }
+
+                // ===== Core Implementation (flowing content, no heading special cases) =====
+                function paginate(sourceRoot, pagesRoot, options) {
+                    pagesRoot.innerHTML = "";
+                    const children = Array.from(sourceRoot.children);
+                    const pages = [];
+                    let currentPage = createEmptyPage(pagesRoot, options);
+                    pages.push(currentPage);
+                    const HEIGHT_CACHE = {}; // per run
+                    let limit = getContentHeightLimit(currentPage, HEIGHT_CACHE);
+                    let contentEl = currentPage.querySelector(".page-content");
+                    const TOLERANCE = 1; // px
+                    function dlog(...args) {
+                        console.debug("[paginate]", ...args);
+                    }
+
+                    for (let i = 0; i < children.length; i++) {
+                        const original = children[i];
+                        const isTable = original.tagName === "TABLE";
+                        const hasForceBefore = original.classList.contains("force-break-before");
+                        const hasForceAfter = original.classList.contains("force-break-after");
+                        const hasAvoidBreak = original.classList.contains("avoid-break");
+
+                        // Handle force-break-before (unless first element on a fresh page)
+                        if (hasForceBefore && contentEl.children.length > 0) {
+                            ({ currentPage, contentEl, limit } = newPage());
+                        }
+
+                        // TABLE HANDLING (special because of possible splitting)
+                        if (isTable) {
+                            dlog("Processing table at index", i);
+                            let tableClone = original.cloneNode(true);
+                            contentEl.appendChild(tableClone);
+                            if (contentEl.scrollHeight - limit > TOLERANCE) {
+                                dlog("Splitting table");
+                                contentEl.removeChild(tableClone);
+                                i = handleTableSplit(original, i, contentEl, limit, newPage, TOLERANCE, dlog);
+                            }
+                            if (hasForceAfter) {
+                                dlog("force-break-after after table");
+                                ({ currentPage, contentEl, limit } = newPage());
+                            }
+                            continue; // proceed to next top-level child
+                        }
+
+                        // NON-TABLE ELEMENTS
+                        const clone = original.cloneNode(true);
+                        contentEl.appendChild(clone);
+
+                        if (contentEl.scrollHeight - limit > TOLERANCE) {
+                            // Overflow after adding clone
+                            const elHeight = clone.getBoundingClientRect().height;
+                            const canFitOnFreshPage = elHeight < limit - TOLERANCE; // Fits within a blank page
+
+                            if (hasAvoidBreak && canFitOnFreshPage && contentEl.children.length > 1) {
+                                // Try moving entire element to a fresh page
+                                contentEl.removeChild(clone);
+                                ({ currentPage, contentEl, limit } = newPage());
+                                contentEl.appendChild(clone);
+                            }
+                        }
+
+                        // If it still overflows now (very tall element) we allow spill (future enhancement: internal splitting)
+                        if (contentEl.scrollHeight - limit > TOLERANCE) {
+                            // If avoid-break but element taller than a page, nothing more we can do; leave it.
+                            // If NOT avoid-break, and not first element on page, try moving to new page once.
+                            if (!hasAvoidBreak) {
+                                const elHeight2 = clone.getBoundingClientRect().height;
+                                if (elHeight2 < limit - TOLERANCE && contentEl.children.length > 1) {
+                                    contentEl.removeChild(clone);
+                                    ({ currentPage, contentEl, limit } = newPage());
+                                    contentEl.appendChild(clone);
+                                }
+                            }
+                        }
+
+                        // force-break-after (start a new page for subsequent content)
+                        if (hasForceAfter) {
+                            ({ currentPage, contentEl, limit } = newPage());
+                        }
+                    }
+
+                    if (document.body.classList.contains("debug")) {
+                        pages.forEach((p) => {
+                            const pc = p.querySelector(".page-content");
+                            pc.setAttribute("data-height-used", pc.scrollHeight);
+                            pc.setAttribute("data-height-limit", limit);
+                        });
+                    }
+
+                    return { pages, contentLimitPx: limit };
+
+                    function newPage() {
+                        currentPage = createEmptyPage(pagesRoot, options);
+                        pages.push(currentPage);
+                        contentEl = currentPage.querySelector(".page-content");
+                        limit = getContentHeightLimit(currentPage, HEIGHT_CACHE);
+                        return { currentPage, contentEl, limit };
+                    }
+                }
+
+                function handleTableSplit(
+                    originalTable,
+                    currentIndex,
+                    contentEl,
+                    limit,
+                    newPageFn,
+                    tolerance,
+                    dlog = () => {}
+                ) {
+                    const header = originalTable.tHead ? originalTable.tHead.cloneNode(true) : null;
+                    const bodyRows = Array.from(originalTable.tBodies[0]?.rows || []);
+                    if (bodyRows.length === 0) {
+                        dlog("Table has no body rows to split; inserting whole table");
+                        contentEl.appendChild(originalTable.cloneNode(true));
+                        return currentIndex;
+                    }
+                    let rowPtr = 0;
+                    while (rowPtr < bodyRows.length) {
+                        const segTable = document.createElement("table");
+                        segTable.setAttribute("data-split-table", "");
+                        if (header) segTable.appendChild(header.cloneNode(true));
+                        const segBody = document.createElement("tbody");
+                        segTable.appendChild(segBody);
+                        contentEl.appendChild(segTable);
+
+                        let lastGoodCount = 0;
+                        for (; rowPtr < bodyRows.length; rowPtr++) {
+                            const testRow = bodyRows[rowPtr].cloneNode(true);
+                            segBody.appendChild(testRow);
+                            if (contentEl.scrollHeight - limit > tolerance) {
+                                segBody.removeChild(testRow);
+                                dlog("Row overflow -> break segment");
+                                break;
+                            } else {
+                                lastGoodCount++;
+                            }
+                        }
+                        if (lastGoodCount === 0) {
+                            // single very tall row
+                            dlog("Single very tall row forced onto page");
+                            segBody.appendChild(bodyRows[rowPtr].cloneNode(true));
+                            rowPtr++;
+                        }
+                        if (rowPtr < bodyRows.length) {
+                            ({ contentEl, limit } = newPageFn());
+                        }
+                    }
+                    return currentIndex;
+                }
+
+                // Remove unused legacy helpers
+                // function collectTopLevelBlocks(root) { ... } // obsolete
+
+                // ===== Core Implementation =====
+                function createEmptyPage(pagesRoot, options) {
+                    const page = document.createElement("div");
+                    page.className = "page";
+                    const headerText = options.headerText || "Sample Report Header";
+                    const dateStr = (options.date instanceof Date ? options.date : new Date()).toLocaleDateString();
+                    page.innerHTML = `
+            <div class="page-header">${headerText}</div>
+            <div class="page-content"></div>
+            <div class="page-footer">
+              <div class="page-number"></div>
+              <div class="page-date">Generated: <span>${dateStr}</span></div>
+            </div>`;
+                    pagesRoot.appendChild(page);
+                    return page;
+                }
+
+                function getContentHeightLimit(page, cache) {
+                    if (cache.limit) return cache.limit;
+                    const content = page.querySelector(".page-content");
+                    cache.limit = content.getBoundingClientRect().height;
+                    return cache.limit;
+                }
+            })();
+        </script>
+    </body>
+</html>
