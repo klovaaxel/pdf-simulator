@@ -188,7 +188,7 @@
             }
         </style>
     </head>
-    <body contenteditable="true">
+    <body>
         <!-- Container whose children (sections) will be paginated dynamically -->
         <div id="dynamic-sections" style="display: none">
             <h1>PDF-like Page Layout Demo</h1>
@@ -334,129 +334,159 @@
         <div id="pages-root"></div>
         <script>
             (function () {
+                console.debug("[pdf] loader start");
+
+                // ===== State =====
+                let BLOCK_COUNTER = 0;
+                function nextBlockId() {
+                    return "b" + ++BLOCK_COUNTER;
+                }
+
+                const LIVE = { enabled: false, observer: null, rebuilding: false, pending: false };
+
                 // ===== Public API =====
-                window.rebuildPDFView = rebuildPDFView; // builds & injects into #pages-root, returns HTML string
-                window.buildPDFViewHTML = buildPDFViewHTML; // returns HTML string only (does not inject)
+                window.rebuildPDFView = rebuildPDFView;
+                window.buildPDFViewHTML = buildPDFViewHTML;
+                window.enableLivePagination = enableLivePagination;
 
                 document.addEventListener("DOMContentLoaded", () => {
+                    console.debug("[pdf] DOMContentLoaded");
                     rebuildPDFView();
+                    enableLivePagination();
                 });
 
-                // ===== High-level API =====
+                // ===== High-level Rebuild =====
                 function rebuildPDFView(options = {}) {
                     const pagesRoot = document.getElementById("pages-root");
-                    if (!pagesRoot) return "";
+                    if (!pagesRoot) {
+                        console.debug("[pdf] no #pages-root found");
+                        return "";
+                    }
+                    console.debug("[pdf] rebuildPDFView start");
                     const html = buildPDFViewHTML(options);
                     pagesRoot.innerHTML = html;
+                    console.debug("[pdf] rebuildPDFView injected pages:", pagesRoot.querySelectorAll(".page").length);
                     return html;
                 }
 
                 function buildPDFViewHTML(options = {}) {
                     const dynamicRoot = document.getElementById("dynamic-sections");
-                    if (!dynamicRoot) return "";
-
-                    if (options.regenerate === true) {
-                        generateDynamicContent(dynamicRoot, true);
+                    if (!dynamicRoot) {
+                        console.debug("[pdf] no #dynamic-sections");
+                        return "";
                     }
 
-                    // Off-DOM container for accurate layout measurements
+                    if (options.regenerate === true) {
+                        console.debug("[pdf] (unused) regenerate flag seen");
+                    }
+
                     const tempHost = document.createElement("div");
                     tempHost.style.cssText = "position:absolute;left:-9999px;top:0;visibility:hidden;";
                     document.body.appendChild(tempHost);
-
                     const { pages } = paginate(dynamicRoot, tempHost, options);
                     const html = pages.map((p) => p.outerHTML).join("");
                     document.body.removeChild(tempHost);
                     return html;
                 }
 
-                // ===== Core Implementation (flowing content, no heading special cases) =====
+                // ===== Pagination Core =====
                 function paginate(sourceRoot, pagesRoot, options) {
                     pagesRoot.innerHTML = "";
                     const children = Array.from(sourceRoot.children);
                     const pages = [];
                     let currentPage = createEmptyPage(pagesRoot, options);
                     pages.push(currentPage);
-                    const HEIGHT_CACHE = {}; // per run
-                    let limit = getContentHeightLimit(currentPage, HEIGHT_CACHE);
+
                     let contentEl = currentPage.querySelector(".page-content");
-                    const TOLERANCE = 1; // px
-                    function dlog(...args) {
-                        console.debug("[paginate]", ...args);
+                    let limit = getContentHeightLimit(currentPage); // dynamic measurement
+                    const TOLERANCE = -24; // px of acceptable overflow before breaking (allows for small inaccuracies)
+                    function dlog(...a) {
+                        console.debug("[paginate]", ...a);
+                    }
+                    dlog("start, child count", children.length, "limit", limit);
+
+                    function recalcLimit() {
+                        limit = getContentHeightLimit(currentPage);
+                        return limit;
                     }
 
                     for (let i = 0; i < children.length; i++) {
+                        recalcLimit();
                         const original = children[i];
+                        if (!original.dataset.blockId) original.dataset.blockId = nextBlockId();
+                        const blockId = original.dataset.blockId;
                         const isTable = original.tagName === "TABLE";
                         const hasForceBefore = original.classList.contains("force-break-before");
                         const hasForceAfter = original.classList.contains("force-break-after");
                         const hasAvoidBreak = original.classList.contains("avoid-break");
 
-                        // Handle force-break-before (unless first element on a fresh page)
                         if (hasForceBefore && contentEl.children.length > 0) {
-                            ({ currentPage, contentEl, limit } = newPage());
+                            dlog("force-break-before -> new page");
+                            ({ contentEl } = newPage());
+                            recalcLimit();
                         }
 
-                        // TABLE HANDLING (special because of possible splitting)
                         if (isTable) {
-                            dlog("Processing table at index", i);
-                            let tableClone = original.cloneNode(true);
+                            dlog(
+                                "table candidate index",
+                                i,
+                                "rows",
+                                original.tBodies[0]?.rows.length || 0,
+                                "limit",
+                                limit
+                            );
+                            const tableClone = original.cloneNode(true);
+                            tableClone.dataset.blockId = blockId;
                             contentEl.appendChild(tableClone);
                             if (contentEl.scrollHeight - limit > TOLERANCE) {
-                                dlog("Splitting table");
+                                dlog("table overflow -> split");
                                 contentEl.removeChild(tableClone);
                                 i = handleTableSplit(original, i, contentEl, limit, newPage, TOLERANCE, dlog);
                             }
                             if (hasForceAfter) {
                                 dlog("force-break-after after table");
-                                ({ currentPage, contentEl, limit } = newPage());
+                                ({ contentEl } = newPage());
+                                recalcLimit();
                             }
-                            continue; // proceed to next top-level child
+                            continue;
                         }
 
-                        // NON-TABLE ELEMENTS
                         const clone = original.cloneNode(true);
+                        clone.dataset.blockId = blockId;
                         contentEl.appendChild(clone);
-
+                        recalcLimit();
                         if (contentEl.scrollHeight - limit > TOLERANCE) {
-                            // Overflow after adding clone
                             const elHeight = clone.getBoundingClientRect().height;
-                            const canFitOnFreshPage = elHeight < limit - TOLERANCE; // Fits within a blank page
-
-                            if (hasAvoidBreak && canFitOnFreshPage && contentEl.children.length > 1) {
-                                // Try moving entire element to a fresh page
+                            const freshLimit = getContentHeightLimit(currentPage);
+                            const canFitFresh = elHeight < freshLimit - TOLERANCE;
+                            if (hasAvoidBreak && canFitFresh && contentEl.children.length > 1) {
+                                dlog("overflow, retry on fresh page (avoid-break)");
                                 contentEl.removeChild(clone);
-                                ({ currentPage, contentEl, limit } = newPage());
+                                ({ contentEl } = newPage());
+                                recalcLimit();
                                 contentEl.appendChild(clone);
                             }
                         }
-
-                        // If it still overflows now (very tall element) we allow spill (future enhancement: internal splitting)
+                        recalcLimit();
                         if (contentEl.scrollHeight - limit > TOLERANCE) {
-                            // If avoid-break but element taller than a page, nothing more we can do; leave it.
-                            // If NOT avoid-break, and not first element on page, try moving to new page once.
                             if (!hasAvoidBreak) {
                                 const elHeight2 = clone.getBoundingClientRect().height;
                                 if (elHeight2 < limit - TOLERANCE && contentEl.children.length > 1) {
+                                    dlog("overflow, move block to new page");
                                     contentEl.removeChild(clone);
-                                    ({ currentPage, contentEl, limit } = newPage());
+                                    ({ contentEl } = newPage());
+                                    recalcLimit();
                                     contentEl.appendChild(clone);
+                                } else {
+                                    dlog("very tall element allowed to spill");
                                 }
                             }
                         }
-
-                        // force-break-after (start a new page for subsequent content)
                         if (hasForceAfter) {
-                            ({ currentPage, contentEl, limit } = newPage());
+                            dlog("force-break-after");
+                            ({ contentEl } = newPage());
+                            recalcLimit();
                         }
-                    }
-
-                    if (document.body.classList.contains("debug")) {
-                        pages.forEach((p) => {
-                            const pc = p.querySelector(".page-content");
-                            pc.setAttribute("data-height-used", pc.scrollHeight);
-                            pc.setAttribute("data-height-limit", limit);
-                        });
                     }
 
                     return { pages, contentLimitPx: limit };
@@ -465,8 +495,9 @@
                         currentPage = createEmptyPage(pagesRoot, options);
                         pages.push(currentPage);
                         contentEl = currentPage.querySelector(".page-content");
-                        limit = getContentHeightLimit(currentPage, HEIGHT_CACHE);
-                        return { currentPage, contentEl, limit };
+                        limit = getContentHeightLimit(currentPage);
+                        dlog("new page created, limit=", limit);
+                        return { contentEl, limit };
                     }
                 }
 
@@ -481,38 +512,78 @@
                 ) {
                     const header = originalTable.tHead ? originalTable.tHead.cloneNode(true) : null;
                     const bodyRows = Array.from(originalTable.tBodies[0]?.rows || []);
+                    if (!originalTable.dataset.blockId) originalTable.dataset.blockId = nextBlockId();
+                    const originId = originalTable.dataset.blockId;
                     if (bodyRows.length === 0) {
-                        dlog("Table has no body rows to split; inserting whole table");
-                        contentEl.appendChild(originalTable.cloneNode(true));
+                        dlog("empty body -> insert whole");
+                        const single = originalTable.cloneNode(true);
+                        single.dataset.blockId = originId;
+                        contentEl.appendChild(single);
                         return currentIndex;
                     }
                     let rowPtr = 0;
                     while (rowPtr < bodyRows.length) {
-                        const segTable = document.createElement("table");
+                        let segTable = document.createElement("table");
                         segTable.setAttribute("data-split-table", "");
+                        segTable.dataset.originTableId = originId;
                         if (header) segTable.appendChild(header.cloneNode(true));
                         const segBody = document.createElement("tbody");
                         segTable.appendChild(segBody);
                         contentEl.appendChild(segTable);
 
+                        // If just adding the header already overflows and there is existing content, move to new page first
+                        if (contentEl.scrollHeight - limit > tolerance && contentEl.children.length > 1) {
+                            dlog("header alone overflow -> move segment to fresh page");
+                            contentEl.removeChild(segTable);
+                            ({ contentEl, limit } = newPageFn());
+                            segTable = document.createElement("table");
+                            segTable.setAttribute("data-split-table", "");
+                            segTable.dataset.originTableId = originId;
+                            if (header) segTable.appendChild(header.cloneNode(true));
+                            const segBody2 = document.createElement("tbody");
+                            segTable.appendChild(segBody2);
+                            contentEl.appendChild(segTable);
+                        }
+
                         let lastGoodCount = 0;
                         for (; rowPtr < bodyRows.length; rowPtr++) {
                             const testRow = bodyRows[rowPtr].cloneNode(true);
-                            segBody.appendChild(testRow);
+                            segTable.tBodies[0].appendChild(testRow);
                             if (contentEl.scrollHeight - limit > tolerance) {
-                                segBody.removeChild(testRow);
-                                dlog("Row overflow -> break segment");
+                                // overflow after adding test row
+                                segTable.tBodies[0].removeChild(testRow);
+                                dlog("row overflow break segment at row", rowPtr);
                                 break;
                             } else {
                                 lastGoodCount++;
                             }
                         }
+
                         if (lastGoodCount === 0) {
-                            // single very tall row
-                            dlog("Single very tall row forced onto page");
-                            segBody.appendChild(bodyRows[rowPtr].cloneNode(true));
+                            // The next row could not fit at all on this page; move whole segment (header) to new page unless this page is empty of other segments
+                            const pageHasOtherBlocks = contentEl.children.length > 1; // header-only segment counts as 1 currently
+                            if (pageHasOtherBlocks) {
+                                dlog("first row can't fit -> relocate segment to new page before forcing row");
+                                contentEl.removeChild(segTable);
+                                ({ contentEl, limit } = newPageFn());
+                                // rebuild segTable on the fresh page
+                                segTable = document.createElement("table");
+                                segTable.setAttribute("data-split-table", "");
+                                segTable.dataset.originTableId = originId;
+                                if (header) segTable.appendChild(header.cloneNode(true));
+                                const newBody = document.createElement("tbody");
+                                segTable.appendChild(newBody);
+                                contentEl.appendChild(segTable);
+                            } else {
+                                dlog("first row too tall even on fresh page -> allow spill");
+                            }
+                            // Force single row (may still overflow, acceptable spill policy for very tall row)
+                            const forced = bodyRows[rowPtr].cloneNode(true);
+                            segTable.tBodies[0].appendChild(forced);
                             rowPtr++;
                         }
+
+                        // If more rows remain, start a new page for next segment
                         if (rowPtr < bodyRows.length) {
                             ({ contentEl, limit } = newPageFn());
                         }
@@ -520,10 +591,372 @@
                     return currentIndex;
                 }
 
-                // Remove unused legacy helpers
-                // function collectTopLevelBlocks(root) { ... } // obsolete
+                // ===== Live Editing =====
+                function enableLivePagination({ debounceMs = 400 } = {}) {
+                    if (LIVE.enabled) {
+                        console.debug("[live] already enabled");
+                        return;
+                    }
+                    const pagesRoot = document.getElementById("pages-root");
+                    const sourceRoot = document.getElementById("dynamic-sections");
+                    if (!pagesRoot || !sourceRoot) {
+                        console.debug("[live] missing roots");
+                        return;
+                    }
+                    pagesRoot.setAttribute("contenteditable", "true");
+                    const schedule = () => {
+                        console.debug(
+                            "[live] schedule invoked; rebuilding=",
+                            LIVE.rebuilding,
+                            "suppress=",
+                            LIVE.suppressNext
+                        );
+                        if (LIVE.rebuilding) {
+                            console.debug("[live] schedule skip: rebuilding in progress");
+                            return;
+                        }
+                        if (LIVE.suppressNext) {
+                            console.debug("[live] schedule skip: suppressNext flag");
+                            return;
+                        }
+                        clearTimeout(LIVE.pending);
+                        LIVE.pending = setTimeout(performReflow, debounceMs);
+                    };
+                    pagesRoot.addEventListener("input", schedule);
+                    pagesRoot.addEventListener("paste", schedule);
+                    pagesRoot.addEventListener("keydown", (e) => {
+                        if (["Enter", "Backspace", "Delete"].includes(e.key)) schedule();
+                    });
+                    LIVE.observer = new MutationObserver((muts) => {
+                        if (LIVE.rebuilding) return; // ignore our own rebuilds
+                        schedule();
+                    });
+                    LIVE.observer.observe(pagesRoot, { childList: true, subtree: true, characterData: true });
+                    LIVE.enabled = true;
+                    LIVE.lastHash = null;
+                    console.debug("[live] enabled");
 
-                // ===== Core Implementation =====
+                    function performReflow() {
+                        if (LIVE.rebuilding) return;
+                        LIVE.rebuilding = true;
+                        console.debug("[live] performReflow start");
+                        // Insert a lightweight marker at caret (more reliable than char offset when paragraphs split)
+                        const markerPlaced = placeCaretMarker(pagesRoot);
+                        // Fallback selection snapshot (legacy) in case marker fails
+                        const selState = markerPlaced ? null : captureSelection(pagesRoot);
+                        try {
+                            if (LIVE.observer) LIVE.observer.disconnect();
+                            flattenPagesBackIntoSource(pagesRoot, sourceRoot);
+                            const html = buildPDFViewHTML();
+                            // Ignore caret marker when computing hash so transient markers don't force rebuilds
+                            const hashReady = html.replace(/<span[^>]*data-caret-marker="1"[^>]*><\/span>/g, "");
+                            const newHash = hashString(hashReady);
+                            if (newHash === LIVE.lastHash) {
+                                console.debug("[live] no DOM diff (hash match) -> skip inject");
+                                if (markerPlaced) {
+                                    // We never injected new HTML, marker is still present in pagesRoot; just restore & remove
+                                    restoreCaretMarker(pagesRoot);
+                                } else {
+                                    restoreSelection(pagesRoot, selState);
+                                }
+                            } else {
+                                LIVE.lastHash = newHash;
+                                pagesRoot.innerHTML = html;
+                                console.debug("[live] injected new pages (hash updated)");
+                                if (markerPlaced) {
+                                    restoreCaretMarker(pagesRoot);
+                                } else {
+                                    restoreSelection(pagesRoot, selState);
+                                }
+                                pagesRoot.focus();
+                            }
+                            LIVE.suppressNext = true;
+                            setTimeout(() => {
+                                LIVE.suppressNext = false;
+                            }, 0);
+                        } finally {
+                            if (LIVE.observer) {
+                                LIVE.observer.observe(pagesRoot, {
+                                    childList: true,
+                                    subtree: true,
+                                    characterData: true,
+                                });
+                            }
+                            LIVE.rebuilding = false;
+                            console.debug("[live] performReflow end");
+                        }
+                    }
+                }
+
+                // ===== Selection Preservation Utilities =====
+                function placeCaretMarker(root) {
+                    const sel = window.getSelection();
+                    if (!sel || sel.rangeCount === 0) return false;
+                    const range = sel.getRangeAt(0);
+                    if (!root.contains(range.startContainer)) return false;
+                    // Avoid duplicating markers
+                    root.querySelectorAll("[data-caret-marker]")?.forEach((n) => n.remove());
+                    const span = document.createElement("span");
+                    span.setAttribute("data-caret-marker", "1");
+                    span.style.cssText =
+                        "display:inline-block;width:0;height:0;overflow:hidden;line-height:0;font-size:0;";
+                    range.insertNode(span);
+                    // Collapse after marker so typing continues in correct place pre-rebuild
+                    range.setStartAfter(span);
+                    range.collapse(true);
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                    return true;
+                }
+
+                function restoreCaretMarker(root) {
+                    const marker = root.querySelector("[data-caret-marker]");
+                    if (!marker) return;
+                    const sel = window.getSelection();
+                    if (!sel) {
+                        marker.remove();
+                        return;
+                    }
+                    const range = document.createRange();
+                    range.setStartAfter(marker);
+                    range.collapse(true);
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                    marker.remove();
+                }
+
+                function captureSelection(root) {
+                    const sel = window.getSelection();
+                    if (!sel || sel.rangeCount === 0) return null;
+                    const range = sel.getRangeAt(0);
+                    if (!root.contains(range.startContainer)) return null;
+                    // Try normal block resolution first
+                    let el =
+                        range.startContainer.nodeType === 1 ? range.startContainer : range.startContainer.parentElement;
+                    while (el && el !== root && !el.dataset.blockId && !el.dataset.originTableId) {
+                        el = el.parentElement;
+                    }
+                    if (el && el !== root) {
+                        const blockId = el.dataset.blockId || el.dataset.originTableId;
+                        if (!blockId) return null;
+                        // Compute character offset within that block
+                        let charOffset = 0;
+                        const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+                        let node;
+                        while ((node = walker.nextNode())) {
+                            if (node === range.startContainer) {
+                                charOffset += range.startOffset;
+                                break;
+                            } else {
+                                charOffset += node.textContent.length;
+                            }
+                        }
+                        return { blockId, charOffset };
+                    }
+                    // Fallback: caret might be in a freshly created empty line (Enter) that has no blockId yet.
+                    // Strategy: find preceding sibling with a blockId and mark position as AFTER that block.
+                    const pageContent =
+                        range.startContainer.parentElement &&
+                        range.startContainer.parentElement.closest(".page-content");
+                    if (!pageContent) return null;
+                    // Determine a reference node inside pageContent to compare order
+                    let refNode =
+                        range.startContainer.nodeType === 1 ? range.startContainer : range.startContainer.parentElement;
+                    if (!pageContent.contains(refNode)) return null;
+                    // Ascend until direct child of pageContent (or pageContent itself if text directly under)
+                    while (refNode && refNode.parentElement && refNode.parentElement !== pageContent) {
+                        refNode = refNode.parentElement;
+                    }
+                    // Collect previous siblings looking for last with data-block-id
+                    let prev = refNode;
+                    while (prev && prev.previousSibling) {
+                        prev = prev.previousSibling;
+                        if (prev.nodeType === 1 && (prev.dataset.blockId || prev.dataset.originTableId)) {
+                            const blockId = prev.dataset.blockId || prev.dataset.originTableId;
+                            if (blockId) {
+                                // Compute char length of that block for reference (end position)
+                                let len = 0;
+                                const walker = document.createTreeWalker(prev, NodeFilter.SHOW_TEXT, null);
+                                let tn;
+                                while ((tn = walker.nextNode())) len += tn.textContent.length;
+                                return { blockId, charOffset: len, after: true };
+                            }
+                        }
+                    }
+                    return null;
+                }
+
+                function restoreSelection(root, state) {
+                    if (!state) return;
+                    const el =
+                        root.querySelector('[data-block-id="' + state.blockId + '"]') ||
+                        root.querySelector('[data-origin-table-id="' + state.blockId + '"]');
+                    if (!el) return;
+                    if (state.after) {
+                        // We want caret at start of the next block if it exists; else end of current block.
+                        const allBlocks = Array.from(root.querySelectorAll("[data-block-id]"));
+                        const idx = allBlocks.indexOf(el);
+                        let targetBlock = null;
+                        if (idx !== -1 && idx + 1 < allBlocks.length) {
+                            targetBlock = allBlocks[idx + 1];
+                        }
+                        if (!targetBlock) {
+                            // place at end of el
+                            let lastText = null;
+                            const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+                            let tn;
+                            while ((tn = walker.nextNode())) lastText = tn;
+                            const sel = window.getSelection();
+                            if (!sel) return;
+                            const r = document.createRange();
+                            if (lastText) {
+                                r.setStart(lastText, lastText.textContent.length);
+                            } else {
+                                r.selectNodeContents(el);
+                                r.collapse(false);
+                            }
+                            sel.removeAllRanges();
+                            sel.addRange(r);
+                            return;
+                        } else {
+                            // place at start of targetBlock
+                            const sel = window.getSelection();
+                            if (!sel) return;
+                            const r = document.createRange();
+                            // Find first text node
+                            let firstText = null;
+                            const walker2 = document.createTreeWalker(targetBlock, NodeFilter.SHOW_TEXT, null);
+                            firstText = walker2.nextNode();
+                            if (firstText) {
+                                r.setStart(firstText, 0);
+                            } else {
+                                r.selectNodeContents(targetBlock);
+                                r.collapse(true);
+                            }
+                            sel.removeAllRanges();
+                            sel.addRange(r);
+                            return;
+                        }
+                    }
+                    // Original behavior
+                    let remaining = state.charOffset;
+                    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+                    let node;
+                    let targetNode = null;
+                    let offset = 0;
+                    while ((node = walker.nextNode())) {
+                        const len = node.textContent.length;
+                        if (remaining <= len) {
+                            targetNode = node;
+                            offset = remaining;
+                            break;
+                        }
+                        remaining -= len;
+                    }
+                    if (!targetNode) {
+                        targetNode = el;
+                        offset = el.childNodes.length;
+                        try {
+                            const revWalker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+                            let lastText = null,
+                                tn;
+                            while ((tn = revWalker.nextNode())) lastText = tn;
+                            if (lastText) {
+                                targetNode = lastText;
+                                offset = lastText.textContent.length;
+                            }
+                        } catch {}
+                    }
+                    const sel = window.getSelection();
+                    if (!sel) return;
+                    const r = document.createRange();
+                    try {
+                        r.setStart(targetNode, Math.min(offset, (targetNode.textContent || "").length || 0));
+                    } catch (e) {
+                        return;
+                    }
+                    r.collapse(true);
+                    sel.removeAllRanges();
+                    sel.addRange(r);
+                }
+
+                function hashString(str) {
+                    let h = 0,
+                        i = 0,
+                        len = str.length;
+                    if (!len) return h.toString();
+                    // Simple 32-bit hash
+                    for (; i < len; i++) {
+                        h = (h << 5) - h + str.charCodeAt(i);
+                        h |= 0;
+                    }
+                    return h.toString();
+                }
+
+                function flattenPagesBackIntoSource(pagesRoot, sourceRoot) {
+                    console.debug("[flatten] start");
+                    const pageContents = pagesRoot.querySelectorAll(".page-content");
+                    const fragment = document.createDocumentFragment();
+                    const tableBuckets = new Map();
+                    const order = [];
+
+                    pageContents.forEach((pc) => {
+                        // Walk childNodes to preserve ordering of text nodes relative to elements
+                        Array.from(pc.childNodes).forEach((node) => {
+                            if (node.nodeType === 3) {
+                                // text
+                                if (!node.textContent.trim()) return; // ignore pure whitespace
+                                const wrapper = document.createElement("p");
+                                wrapper.textContent = node.textContent;
+                                wrapper.dataset.blockId = nextBlockId();
+                                order.push({ type: "block", id: wrapper.dataset.blockId, node: wrapper });
+                                return;
+                            }
+                            if (node.nodeType !== 1) return; // element only
+                            const child = node; // element
+                            if (child.matches("[data-split-table]")) {
+                                const originId = child.dataset.originTableId;
+                                if (!tableBuckets.has(originId)) {
+                                    tableBuckets.set(originId, { headerHTML: "", rows: [] });
+                                    order.push({ type: "table", id: originId });
+                                }
+                                const bucket = tableBuckets.get(originId);
+                                const thead = child.querySelector("thead");
+                                if (thead && !bucket.headerHTML) bucket.headerHTML = thead.outerHTML;
+                                child.querySelectorAll("tbody tr").forEach((r) => bucket.rows.push(r.cloneNode(true)));
+                            } else if (child.tagName === "TABLE" && !child.hasAttribute("data-split-table")) {
+                                const id = child.dataset.blockId || (child.dataset.blockId = nextBlockId());
+                                order.push({ type: "single-table", id, node: child });
+                            } else {
+                                if (!child.dataset.blockId) child.dataset.blockId = nextBlockId();
+                                order.push({ type: "block", id: child.dataset.blockId, node: child });
+                            }
+                        });
+                    });
+
+                    for (const entry of order) {
+                        if (entry.type === "table") {
+                            const bucket = tableBuckets.get(entry.id);
+                            if (!bucket) continue;
+                            const table = document.createElement("table");
+                            table.dataset.blockId = entry.id;
+                            if (bucket.headerHTML) table.insertAdjacentHTML("beforeend", bucket.headerHTML);
+                            const tbody = document.createElement("tbody");
+                            bucket.rows.forEach((r) => tbody.appendChild(r));
+                            table.appendChild(tbody);
+                            fragment.appendChild(table);
+                        } else if (entry.type === "single-table") {
+                            fragment.appendChild(entry.node.cloneNode(true));
+                        } else if (entry.type === "block") {
+                            fragment.appendChild(entry.node.cloneNode(true));
+                        }
+                    }
+                    sourceRoot.innerHTML = "";
+                    sourceRoot.appendChild(fragment);
+                    console.debug("[flatten] rebuilt source children:", sourceRoot.children.length);
+                }
+
+                // === Utility page builders (was truncated previously) ===
                 function createEmptyPage(pagesRoot, options) {
                     const page = document.createElement("div");
                     page.className = "page";
@@ -540,12 +973,21 @@
                     return page;
                 }
 
-                function getContentHeightLimit(page, cache) {
-                    if (cache.limit) return cache.limit;
+                function getContentHeightLimit(page) {
                     const content = page.querySelector(".page-content");
-                    cache.limit = content.getBoundingClientRect().height;
-                    return cache.limit;
+                    const footer = page.querySelector(".page-footer");
+                    if (!content) return 0;
+                    // If footer exists compute distance between top of content and top of footer as usable height
+                    if (footer) {
+                        const usable = footer.offsetTop - content.offsetTop;
+                        // Fallback if something unexpected
+                        if (usable > 0) return usable;
+                    }
+                    // Fallback to current content box height
+                    return content.getBoundingClientRect().height;
                 }
+
+                console.debug("[pdf] script ready");
             })();
         </script>
     </body>
